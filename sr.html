@@ -1,0 +1,574 @@
+<!DOCTYPE html>
+
+<head>
+	<script type="text/javascript">
+//======================================================================//
+//we're using SR units, so seconds are distances too
+var PIXELS_PER_SECOND=60;
+var FRAMES_PER_SECOND=30;
+
+var OBJECT_COLOR="rgb(0, 255, 0)";
+var VELOCITY_COLOR="rgb(255, 0, 0)";
+var BACKGROUND_COLOR="rgb(0, 0, 0)";
+var HIGHLIGHT_COLOR="rgb(0, 255, 255)";
+var SECONDS_COLOR="rgb(255, 255, 0)";
+var SUBSECONDS_COLOR="rgb(255, 128, 0)";
+
+var STATE_DRAW=0;
+var STATE_VELOCITY=10;
+var STATE_PLAYING=20;
+var STATE_SELECTING=30;
+
+var gCanvas;
+var gContext;
+
+var gGridSize;
+
+var gSelected=-1;
+var gState=STATE_DRAW;
+var gObjects=[];
+var gIntervalId;
+
+var gTime;
+var gStartTime;
+var gEndTime;
+var gVelocity;
+
+var gVector;//scratch space to avoid allocating and destroying objects all the time
+var gVector2;
+var gVector3;
+var gVector4;
+var gVector5;
+
+window.onload=main;
+
+function Vector(x, y){
+	this.x=x;
+	this.y=y;
+	this.add=function(other){
+		this.x+=other.x;
+		this.y+=other.y;
+	}
+	this.sub=function(other){
+		this.x-=other.x;
+		this.y-=other.y;
+	}
+	this.mul=function(scalar){
+		this.x*=scalar;
+		this.y*=scalar;
+	}
+	this.dot=function(other){
+		return this.x*other.x+this.y*other.y;
+	}
+	this.setTo=function(other){
+		this.x=other.x;
+		this.y=other.y;
+	}
+}
+
+function Object(x, y){
+	this.points=[new Vector(x, y)];
+	this.clocks=[false];
+	this.velocity=new Vector(0, 0);
+	this.centroid=new Vector(x, y);
+	this.addPoint=function(x, y){
+		this.points.push(new Vector(x, y));
+		this.clocks.push(false);
+		var n=this.points.length;
+		this.centroid.x=this.centroid.x*(n-1)/n+x/n;
+		this.centroid.y=this.centroid.y*(n-1)/n+y/n;
+	}
+	this.removePoint=function(){
+		var n=this.points.length;
+		var x=this.points[this.points.length-1].x;
+		var y=this.points[this.points.length-1].y;
+		this.centroid.x=(this.centroid.x-x/n)*n/(n-1);
+		this.centroid.y=(this.centroid.y-y/n)*n/(n-1);
+		this.points.splice(-1, 1);
+		this.clocks.splice(-1, 1);
+	}
+	this.addClock=function(){
+		this.clocks[this.clocks.length-1]=true;
+	}
+	this.readR=function(i){
+		if(typeof i==='undefined')
+			gVector.setTo(this.centroid);
+		else
+			gVector.setTo(this.points[i]);
+		var v2=gVelocity.dot(gVelocity);
+		if(v2!=0){
+			var gamma=1/Math.sqrt(1-v2);
+			var t=(gTime/gamma+gVector.dot(gVelocity))/(1-this.velocity.dot(gVelocity));
+			gVector2.setTo(this.velocity);
+			gVector2.mul(t);
+			gVector.add(gVector2);
+			//gVector is now the location in the original frame at the correct time
+			var rDotV=gVector.dot(gVelocity);
+			gVector2.setTo(gVelocity);
+			gVector2.mul((gamma-1)/v2*rDotV-gamma*t);
+			gVector.add(gVector2);
+			//gVector is now the location in the current frame at the current time
+		}
+		else{
+			gVector2.setTo(this.velocity);
+			gVector2.mul(gTime);
+			gVector.add(gVector2);
+		}
+		return gVector;
+	}
+	this.readV=function(i){
+		var v2=gVelocity.dot(gVelocity);
+		if(v2==0){
+			gVector.setTo(this.velocity);
+			return gVector;
+		}
+		var gamma=1/Math.sqrt(1-v2);
+		var vDotV=this.velocity.dot(gVelocity);
+		gVector.setTo(gVelocity);
+		gVector.mul((gamma-1)/v2*vDotV-gamma);
+		gVector.add(this.velocity);
+		gVector.mul(1/(gamma*(1-vDotV)));
+		return gVector;
+	}
+	this.readT=function(i){
+		gVector4.setTo(this.readR(i));
+		gVector5.setTo(this.readV(i));
+		var v2=gVector5.dot(gVector5);
+		var gamma=1/Math.sqrt(1-v2);
+		var offset;//so that clocks are synchronized when gVelocity=(0, 0)
+		if(typeof i==='undefined')
+			offset=this.centroid.dot(this.velocity);
+		else
+			offset=this.points[i].dot(this.velocity);
+		return gamma*((gTime+offset)-gVector4.dot(gVector5));
+	}
+}
+
+function snap(a){
+	return Math.floor(a/gGridSize+0.5)*gGridSize;
+}
+
+function draw(){
+	gContext.fillStyle=BACKGROUND_COLOR;
+	gContext.fillRect(0, 0, gCanvas.width, gCanvas.height);
+	frameForm.velocityX.value=gVelocity.x;
+	frameForm.velocityY.value=-gVelocity.y;
+	timeForm.startTime.value=gStartTime;
+	timeForm.endTime.value=gEndTime;
+	gridSizeForm.gridSize.value=gGridSize;
+	canvasForm.width.value=gCanvas.width;
+	canvasForm.height.value=gCanvas.height;
+	if(gState==STATE_DRAW) controlsForm.status.value="Creating.";
+	else if(gState==STATE_VELOCITY) controlsForm.status.value="Velocitizing.";
+	else if(gState==STATE_SELECTING) controlsForm.status.value="Selecting.";
+	for(var i=0; i<gObjects.length; ++i){
+		//draw object
+		gContext.beginPath();
+		if(i==gSelected)
+			gContext.strokeStyle=HIGHLIGHT_COLOR;
+		else
+			gContext.strokeStyle=OBJECT_COLOR;
+		gContext.moveTo(
+			gObjects[i].readR(0).x*PIXELS_PER_SECOND+gCanvas.width/2,
+			gObjects[i].readR(0).y*PIXELS_PER_SECOND+gCanvas.height/2
+		);
+		if(gObjects[i].points.length==1)
+			gContext.lineTo(
+				gObjects[i].readR(0).x*PIXELS_PER_SECOND+gCanvas.width/2,
+				gObjects[i].readR(0).y*PIXELS_PER_SECOND+gCanvas.height/2+1
+			);
+		for(var j=1; j<gObjects[i].points.length; ++j)
+			gContext.lineTo(
+				gObjects[i].readR(j).x*PIXELS_PER_SECOND+gCanvas.width/2,
+				gObjects[i].readR(j).y*PIXELS_PER_SECOND+gCanvas.height/2
+			);
+		gContext.stroke();
+		//draw clocks
+		gContext.beginPath();
+		gContext.strokeStyle=SUBSECONDS_COLOR;
+		for(var j=0; j<gObjects[i].points.length; ++j) if(gObjects[i].clocks[j]){
+			gContext.moveTo(
+				gObjects[i].readR(j).x*PIXELS_PER_SECOND+gCanvas.width/2,
+				gObjects[i].readR(j).y*PIXELS_PER_SECOND+gCanvas.height/2
+			);
+			var t=gObjects[i].readT(j);
+			gContext.lineTo(
+				gObjects[i].readR(j).x*PIXELS_PER_SECOND+gCanvas.width/2+30*Math.sin(t*2*3.1416),
+				gObjects[i].readR(j).y*PIXELS_PER_SECOND+gCanvas.height/2-30*Math.cos(t*2*3.1416)
+			);
+		}
+		gContext.stroke();
+		gContext.beginPath();
+		gContext.strokeStyle=SECONDS_COLOR;
+		for(var j=0; j<gObjects[i].points.length; ++j) if(gObjects[i].clocks[j]){
+			gContext.moveTo(
+				gObjects[i].readR(j).x*PIXELS_PER_SECOND+gCanvas.width/2,
+				gObjects[i].readR(j).y*PIXELS_PER_SECOND+gCanvas.height/2
+			);
+			var t=gObjects[i].readT(j);
+			gContext.lineTo(
+				gObjects[i].readR(j).x*PIXELS_PER_SECOND+gCanvas.width/2+20*Math.sin(Math.floor(t)/12*2*3.1416),
+				gObjects[i].readR(j).y*PIXELS_PER_SECOND+gCanvas.height/2-20*Math.cos(Math.floor(t)/12*2*3.1416)
+			);
+		}
+		gContext.stroke();
+		//draw velocity
+		gContext.beginPath();
+		gContext.strokeStyle=VELOCITY_COLOR;
+		gVector3.setTo(gObjects[i].readV());
+		gVector3.mul(PIXELS_PER_SECOND);
+		gContext.moveTo(
+			gObjects[i].readR().x*PIXELS_PER_SECOND+gCanvas.width/2+gVector3.y/10,
+			gObjects[i].readR().y*PIXELS_PER_SECOND+gCanvas.height/2-gVector3.x/10
+		);
+		gContext.lineTo(
+			gObjects[i].readR().x*PIXELS_PER_SECOND+gCanvas.width/2+gObjects[i].readV().x*PIXELS_PER_SECOND,
+			gObjects[i].readR().y*PIXELS_PER_SECOND+gCanvas.height/2+gObjects[i].readV().y*PIXELS_PER_SECOND
+		);
+		gContext.lineTo(
+			gObjects[i].readR().x*PIXELS_PER_SECOND+gCanvas.width/2-gVector3.y/10,
+			gObjects[i].readR().y*PIXELS_PER_SECOND+gCanvas.height/2+gVector3.x/10
+		);
+		gContext.stroke();
+	}
+}
+
+function update(){
+	gTime+=1/FRAMES_PER_SECOND;
+	var v2=gVelocity.dot(gVelocity);
+	var gamma=1/Math.sqrt(1-v2);
+	if(gTime>=gamma*gEndTime) gTime=gamma*gStartTime;
+	draw();
+}
+
+function click(event){
+	if(gVelocity.x!=0||gVelocity.y!=0){
+		draw();
+		return;
+	}
+	if(gState==STATE_PLAYING) return;
+	//figure out where the click was relative to the top left of the canvas
+	var screenX, screenY;
+	if(!event) var event=window.event;
+	if(event.pageX) screenX=event.pageX;
+	if(event.pageY) screenY=event.pageY;
+	else if(event.clientX)
+		screenX=event.clientX+document.body.scrollLeft+document.documentElement.scrollLeft;
+	else if(event.clientY)
+		screenY=event.clientY+document.body.scrollTop+document.documentElement.scrollTop;
+	screenX-=this.offsetLeft;
+	screenY-=this.offsetTop;
+	//snap to grid and convert to seconds
+	var x=screenX-gCanvas.width/2;
+	var y=screenY-gCanvas.height/2;
+	x=snap(x)/PIXELS_PER_SECOND;
+	y=snap(y)/PIXELS_PER_SECOND;
+	//handle
+	if(gSelected==-1){
+		if(gState==STATE_DRAW){
+			//create new object
+			gState=STATE_DRAW;
+			gSelected=gObjects.length;
+			gObjects.push(new Object(x, y));
+		}
+		else if(gState==STATE_SELECTING){
+			var closest=-1;
+			for(var i=0; i<gObjects.length; ++i){
+				var distance=Math.abs(gObjects[i].readR().x-x)+Math.abs(gObjects[i].readR().y-y);
+				if(closest==-1||distance<closest){
+					closest=distance;
+					gSelected=i;
+				}
+			}
+		}
+	}
+	else if(gState==STATE_DRAW){
+		//add to selected object
+		gObjects[gSelected].addPoint(x, y);
+	}
+	else if(gState==STATE_VELOCITY){
+		gObjects[gSelected].velocity.x=x-snap(gObjects[gSelected].readR().x*PIXELS_PER_SECOND)/PIXELS_PER_SECOND;
+		gObjects[gSelected].velocity.y=y-snap(gObjects[gSelected].readR().y*PIXELS_PER_SECOND)/PIXELS_PER_SECOND;
+		var ox=gObjects[gSelected].velocity.x;
+		var oy=gObjects[gSelected].velocity.y;
+		var mag2=ox*ox+oy*oy;
+		if(mag2>1){
+			var mag=Math.sqrt(mag2);
+			gObjects[gSelected].velocity.x/=mag;
+			gObjects[gSelected].velocity.y/=mag;
+		}
+	}
+	draw();
+}
+
+function press(event){
+	if(gState==STATE_PLAYING) return;
+	if(event.keyCode==86){//v
+		gState=STATE_VELOCITY;
+		draw();
+	}
+	else if(event.keyCode==78){//n
+		gSelected=-1;
+		gState=STATE_DRAW;
+		draw();
+	}
+	else if(event.keyCode==68){//d
+		gState=STATE_DRAW;
+		draw();
+	}
+	else if(event.keyCode==85){//u
+		if(gSelected>=0){
+			if(gObjects[gSelected].points.length>1)
+				gObjects[gSelected].removePoint();
+			else{
+				gObjects.splice(gSelected, 1);
+				gSelected=-1;
+				gState=STATE_DRAW;
+			}
+			draw();
+		}
+	}
+	else if(event.keyCode==83){//s
+		gSelected=-1;
+		gState=STATE_SELECTING;
+		draw();
+	}
+	else if(event.keyCode==75){//k
+		if(gSelected!=-1) gObjects.splice(gSelected, 1);
+		gSelected=-1;
+		gState=STATE_DRAW;
+		draw();
+	}
+	else if(event.keyCode==67){//c
+		if(gSelected!=-1) gObjects[gSelected].addClock();
+		draw();
+	}
+	else if(event.keyCode==90){//z
+		gVelocity.x=0;
+		gVelocity.y=0;
+		draw();
+	}
+	else if(event.keyCode==77){//m
+		if(gSelected!=-1){
+			var v=gObjects[gSelected].velocity;
+			if(v.x*v.x+v.y*v.y<1){
+				gVelocity.setTo(v);
+				draw();
+			}
+			else controlsForm.status="You can't go that fast!";
+		}
+	}
+}
+
+function regrid(size){
+	size=parseInt(size);
+	if(isNaN(size)||size<=0){
+		controlsForm.status.value="Grid size must be nonzero positive integer.";
+		return;
+	}
+	controlsForm.status.value="Grid size changed to "+size+".";
+	gGridSize=size;
+}
+
+function rewidth(width){
+	width=parseInt(width);
+	if(isNaN(width)||width<=0){
+		controlsForm.status.value="Width must be nonzero positive integer.";
+		return;
+	}
+	gCanvas.width=width;
+	document.getElementById("canvasDiv").style.width=width+"px";
+	document.getElementById("canvasAndInstructionsDiv").style.width=width+310+"px";
+	draw();
+}
+
+function reheight(height){
+	height=parseInt(height);
+	if(isNaN(height)||height<=0){
+		controlsForm.status.value="Height must be nonzero positive integer.";
+		return;
+	}
+	gCanvas.height=height;
+	draw();
+}
+
+function restartTime(time){
+	time=parseFloat(time);
+	if(isNaN(time)){
+		controlsForm.status.value="Start time must be real number.";
+		return;
+	}
+	gStartTime=parseFloat(time);
+}
+
+function reendTime(time){
+	time=parseFloat(time);
+	if(isNaN(time)){
+		controlsForm.status.value="End time must be real number.";
+		return;
+	}
+	gEndTime=parseFloat(time);
+}
+
+function revelocityX(v){
+	v=parseFloat(v);
+	if(isNaN(v)){
+		controlsForm.status.value="x velocity must be real number.";
+		return;
+	}
+	if(v*v+gVelocity.x*gVelocity.x>=1){
+		controlsForm.status.value="You can't go that fast!";
+		return;
+	}
+	gVelocity.x=v;
+	draw();
+}
+
+function revelocityY(v){
+	v=parseFloat(v);
+	if(isNaN(v)){
+		controlsForm.status.value="y velocity must be real number.";
+		return;
+	}
+	if(v*v+gVelocity.x*gVelocity.x>=1){
+		controlsForm.status.value="You can't go that fast!";
+		return;
+	}
+	gVelocity.y=v;
+	draw();
+}
+
+function reset(){
+	gTime=0;
+}
+
+function play(){
+	if(gState==STATE_PLAYING) return;
+	gTime=gStartTime;
+	gState=STATE_PLAYING;
+	gSelected=-1;
+	gIntervalId=setInterval(update, 30);
+	controlsForm.status.value="Playing.";
+}
+
+function stop(){
+	gState=STATE_DRAW;
+	clearInterval(gIntervalId);
+	reset();
+	draw();
+}
+
+function toScript(){
+	scriptForm.script.value=JSON.stringify([gObjects, gStartTime, gEndTime]);
+}
+
+function fromScript(){
+	var script=eval(scriptForm.script.value);
+	gStartTime=parseFloat(script[1]);
+	gEndTime=parseFloat(script[2]);
+	var objects=script[0];
+	gObjects=[];
+	for(var i=0; i<objects.length; ++i){
+		gObjects.push(new Object(parseFloat(objects[i].points[0].x), parseFloat(objects[i].points[0].y)));
+		if(objects[i].clocks[0]) gObjects[i].clocks[0]=true;
+		for(var j=1; j<objects[i].points.length; ++j){
+			gObjects[i].addPoint(parseFloat(objects[i].points[j].x), parseFloat(objects[i].points[j].y));
+			if(objects[i].clocks[j]) gObjects[i].clocks[j]=true;
+		}
+		gObjects[i].velocity=new Vector(parseFloat(objects[i].velocity.x), parseFloat(objects[i].velocity.y));
+		gObjects[i].centroid=new Vector(parseFloat(objects[i].centroid.x), parseFloat(objects[i].centroid.y));
+	}
+	draw();
+}
+
+function main(){
+	gVector=new Vector(0, 0);
+	gVector2=new Vector(0, 0);
+	gVector3=new Vector(0, 0);
+	gVector4=new Vector(0, 0);
+	gVector5=new Vector(0, 0);
+	gCanvas=document.getElementById("canvas");
+	gContext=gCanvas.getContext("2d");
+	gCanvas.addEventListener("mousedown", click);
+	document.onkeydown=press;
+	regrid(10);
+	restartTime(0);
+	reendTime(5);
+	reset();
+	gVelocity=new Vector(0, 0);
+	revelocityX(0);
+	revelocityY(0);
+	rewidth(640);
+}
+
+//======================================================================//
+	</script>
+</head>
+<body>
+	<div id="canvasAndInstructionsDiv" style="width: 940px; height: 480px; overflow:hidden;">
+		<div id="canvasDiv" style="width: 640px; float: left;">
+			<canvas id="canvas" width="640" height="480">
+				<p>Your browser does not support the canvas element.</p>
+			</canvas><br>
+		</div>
+		<div id="instructionsDiv" style="width: 300px; height: 480px; overflow: auto; float: left; background-color:yellow; margin-left: 10px;">
+			Hit d and click to create and select a new object with a single point, and add more points to a selected object.<br><br>
+			Hit v and to set the velocity of a selected object.<br><br>
+			Hit n to deselect.<br><br>
+			Hit u to remove the most recently added point from the selected object.<br><br>
+			Hit s and click near an object to select it.<br><br>
+			Hit k to remove the selected object.<br><br>
+			Hit c to add a clock to the most recently added point of the selected object.<br><br>
+			Hit z go to the frame with x velocity 0 and y velocity 0.<br><br>
+			Hit m to match the selected object's velocity.<br><br>
+			You can save what you've made by converting it [to JSON], and you can load something already made by loading it [from JSON].<br><br>
+			You have to be in the frame with x and y velocity 0 to edit.<br><br>
+			Speeds are unitless and go from 0 (motionless) to 1 (speed of light).<br><br>
+			Times are measured in seconds.<br><br>
+			Clocks display a subsecond hand that goes around once per second and a second hand that goes around every 12 seconds.<br><br>
+			Clocks are set so that in the frame with x and y velocity 0, they display 0 at time 0.<br><br>
+			Distances are measured in seconds, ie, how far light travels in one second. There are 60 pixels per second.<br><br>
+			The start time and end time are measured in the frame with x and y velocity 0. So, if you have start time as 0 and end time as 5 and are in the frame with x velocity 0.99 and y velocity 0, the simulation will take very long to reach the end time.<br><br>
+			Points and velocities are snapped to a grid whose size you can specify below.<br><br>
+			After changing something in a text box, make sure you press the corresponding button or changes will not take effect.<br><br>
+		</div>
+	</div>
+	<div style="clear: both;">
+		<form name="controlsForm">
+			<input type="button" value="play" onClick="play()"/>
+			<input type="button" value="stop" onClick="stop()"/>
+			<input type="text" name="status" style="width: 300px;"/>
+		</form>
+		<form name="timeForm">
+			<input type="text" name="startTime"/>
+			<input type="button" value="change start time" onClick="restartTime(this.form.startTime.value)"/>
+			<input type="text" name="endTime"/>
+			<input type="button" value="change end time" onClick="reendTime(this.form.endTime.value)"/>
+		</form>
+		<form name="frameForm">
+			<input type="text" name="velocityX"/>
+			<input type="button" value="change x velocity" onClick="revelocityX(this.form.velocityX.value)"/>
+			<input type="text" name="velocityY"/>
+			<input type="button" value="change y velocity" onClick="revelocityY(-this.form.velocityY.value)"/>
+		</form>
+		<br>
+		<form name="gridSizeForm">
+			<input type="text" name="gridSize"/>
+			<input type="button" value="change grid size" onClick="regrid(this.form.gridSize.value)"/>
+		</form>
+		<form name="canvasForm">
+			<input type="text" name="width"/>
+			<input type="button" value="change canvas width" onClick="rewidth(this.form.width.value)"/>
+			<input type="text" name="height"/>
+			<input type="button" value="change canvas height" onClick="reheight(this.form.height.value)"/>
+		</form>
+		<br>
+		<form name="scriptUseForm">
+			<input type="button" value="to JSON" onClick="toScript()"/>
+			<input type="button" value="from JSON" onClick="fromScript()"/>
+		</form>
+		<form name="scriptForm">
+			<textarea name="script" cols="80" rows="25"></textarea>
+		</form>
+	</div>
+</body>
